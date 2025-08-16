@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SSH-Secure.sh — Secure SSH Access By Mostafa Mohamed
-# Harden SSH, provision user keys, and set strict Fail2Ban policies safely.
+# Harden SSH, provision user keys (explicit paste + CTRL+D), and set strict Fail2Ban policies safely.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -27,8 +27,8 @@ trap 'err "Something went wrong. Check messages above."' ERR
 require_root(){ [[ $EUID -eq 0 ]] || die "Run as root (use sudo)."; }
 need_bins(){ for b in "$@"; do command -v "$b" >/dev/null || die "Missing: $b"; done; }
 
-prompt(){ local m="$1" d="${2:-}"; local a; read -r -p "$m ${d:+[$d]}: " a; echo "${a:-$d}"; }
-confirm(){ local m="$1" a; while true; do read -r -p "$m [y/n]: " a; case "$a" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
+prompt(){ local m="$1" d="${2:-}"; local a; read -r -p "$m ${d:+[$d]}: " a < /dev/tty; echo "${a:-$d}"; }
+confirm(){ local m="$1" a; while true; do read -r -p "$m [y/n]: " a < /dev/tty; case "$a" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
 
 # Find homedir even if not /home/<user>
 user_home(){
@@ -37,6 +37,31 @@ user_home(){
   h="$(getent passwd "$u" | awk -F: '{print $6}')"
   [[ -n "$h" ]] || die "Cannot determine home for $u"
   echo "$h"
+}
+
+# ========= Capture pubkey from keyboard (paste + CTRL+D) =========
+capture_pubkey(){
+  local user="$1"
+  local tmp
+  tmp="$(mktemp)"
+  echo "Paste PUBLIC SSH KEY for ${user}, then press ENTER and CTRL+D:"
+  # Force-read from controlling terminal so it ALWAYS waits for your paste
+  cat > "$tmp" < /dev/tty
+  # Normalize CR from PuTTY/Windows pastes
+  tr -d '\r' < "$tmp" > "${tmp}.n"
+  mv -f "${tmp}.n" "$tmp"
+
+  # Basic sanity check
+  if ! grep -qE '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) ' "$tmp"; then
+    warn "The pasted text does not look like a standard OpenSSH public key. Continuing anyway."
+  fi
+
+  # Ensure not empty
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    die "Public key is empty."
+  fi
+  echo "$tmp"
 }
 
 # ========= SSHD drop-in =========
@@ -129,11 +154,10 @@ JAIL
   ok "Fail2Ban active"
 }
 
-# ========= Keys management (always ask) =========
+# ========= Keys management (always interactively paste) =========
 install_key_for_user(){
   local user="$1"
-  local mode="replace"  # replace|append|keep
-  local h auth pub_key
+  local h auth mode="replace"
   h="$(user_home "$user")"
   install -d -m 700 -o "$user" -g "$user" "$h/.ssh"
   auth="$h/.ssh/authorized_keys"
@@ -141,7 +165,7 @@ install_key_for_user(){
   if [[ -s "$auth" ]]; then
     echo "authorized_keys exists for $user."
     while true; do
-      read -r -p "Choose what to do: [R]eplace / [A]ppend / [K]eep existing: " ans
+      read -r -p "Choose what to do: [R]eplace / [A]ppend / [K]eep existing: " ans < /dev/tty
       case "${ans,,}" in
         r|replace) mode="replace"; break;;
         a|append)  mode="append";  break;;
@@ -150,25 +174,25 @@ install_key_for_user(){
     done
   fi
 
+  local tmp=""
   if [[ "$mode" != "keep" ]]; then
-    echo "Paste PUBLIC SSH KEY for ${user}, then press ENTER and CTRL+D:"
-    pub_key="$(</dev/stdin || true)"
-    pub_key="${pub_key//[$'\r']}"
-    [[ -z "$pub_key" ]] && die "Public key is empty."
+    tmp="$(capture_pubkey "$user")"
   fi
 
   umask 077
   case "$mode" in
     replace)
-      printf '%s\n' "$pub_key" > "$auth"
+      cat "$tmp" > "$auth"
       ;;
     append)
-      printf '\n%s\n' "$pub_key" >> "$auth"
+      printf '\n' >> "$auth" 2>/dev/null || true
+      cat "$tmp" >> "$auth"
       ;;
     keep)
       ok "Keeping existing authorized_keys for $user"
       ;;
   esac
+  [[ -n "$tmp" && -f "$tmp" ]] && rm -f "$tmp"
 
   chown "$user:$user" "$auth"
   chmod 600 "$auth"
@@ -197,11 +221,11 @@ maybe_add_sudo(){
 # ========= Main =========
 main(){
   require_root
-  need_bins awk grep cut getent id useradd usermod install chmod chown systemctl sshd
+  need_bins awk grep cut getent id useradd usermod install chmod chown systemctl sshd cat tr
 
   banner
   bold "This will:"
-  echo " - Create/reuse non-root user and set SSH public key"
+  echo " - Create/reuse non-root user and set SSH public key (paste + CTRL+D)"
   echo " - Harden SSH via drop-in config (safe reload)"
   echo " - Configure strict Fail2Ban rules (optional)"
   hr
